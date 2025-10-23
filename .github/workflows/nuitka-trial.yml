@@ -1,0 +1,238 @@
+name: Nuitka Trial Build
+
+on:
+  push:
+    branches:
+      - 'claude/optimize-nuitka-build-*'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-nuitka:
+    name: Build with Nuitka on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.10"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Display Python version
+        run: python --version
+
+      - name: Install system dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache patchelf
+
+      - name: Install dependencies (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -e "./markitdown/packages/markitdown[all]"
+          pip install -r requirements-nuitka.txt
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python -m venv venv
+          source venv/Scripts/activate
+          python -m pip install --upgrade pip
+          pip install -e "./markitdown/packages/markitdown[all]"
+          pip install -r requirements-nuitka.txt
+
+      - name: Build binary with Nuitka (Unix)
+        if: runner.os != 'Windows'
+        timeout-minutes: 30
+        run: |
+          source venv/bin/activate
+          python scripts/build_nuitka.py
+
+      - name: Build binary with Nuitka (Windows)
+        if: runner.os == 'Windows'
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          source venv/Scripts/activate
+          python scripts/build_nuitka.py
+
+      - name: Get platform name
+        id: platform
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            echo "name=linux" >> $GITHUB_OUTPUT
+            echo "binary=markitdown.bin" >> $GITHUB_OUTPUT
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            echo "name=darwin" >> $GITHUB_OUTPUT
+            echo "binary=markitdown.bin" >> $GITHUB_OUTPUT
+          elif [ "${{ runner.os }}" = "Windows" ]; then
+            echo "name=win32" >> $GITHUB_OUTPUT
+            echo "binary=markitdown.exe" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Test binary and measure cold-start time (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          BINARY_PATH="bin/${{ steps.platform.outputs.name }}-nuitka/${{ steps.platform.outputs.binary }}"
+
+          echo "=== Testing Nuitka binary ==="
+          echo "Binary path: $BINARY_PATH"
+
+          # Check if binary exists
+          if [ ! -f "$BINARY_PATH" ]; then
+            echo "Error: Binary not found at $BINARY_PATH"
+            ls -la bin/
+            exit 1
+          fi
+
+          # Make sure it's executable
+          chmod +x "$BINARY_PATH"
+
+          # Get binary size
+          ls -lh "$BINARY_PATH"
+
+          # Test 1: Measure cold-start time with --help
+          echo ""
+          echo "=== Cold-start test with --help ==="
+          time "$BINARY_PATH" --help
+
+          # Test 2: Convert test.html to test.md and measure time
+          echo ""
+          echo "=== Converting test.html to test.md ==="
+          time "$BINARY_PATH" test.html > test.md
+
+          # Show the output
+          echo ""
+          echo "=== Conversion output (test.md) ==="
+          cat test.md
+
+          # Verify output contains expected content
+          echo ""
+          echo "=== Verification ==="
+          if grep -q "Nuitka Binary Performance Test" test.md; then
+            echo "✓ Conversion successful - found expected heading"
+          else
+            echo "✗ Conversion failed - expected heading not found"
+            exit 1
+          fi
+
+          # Test 3: Multiple runs to test warm performance
+          echo ""
+          echo "=== Warm-start performance test (5 runs) ==="
+          for i in {1..5}; do
+            echo "Run $i:"
+            time "$BINARY_PATH" test.html > /dev/null
+          done
+
+      - name: Test binary and measure cold-start time (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          BINARY_PATH="bin/${{ steps.platform.outputs.name }}-nuitka/${{ steps.platform.outputs.binary }}"
+
+          echo "=== Testing Nuitka binary ==="
+          echo "Binary path: $BINARY_PATH"
+
+          # Check if binary exists
+          if [ ! -f "$BINARY_PATH" ]; then
+            echo "Error: Binary not found at $BINARY_PATH"
+            ls -la bin/
+            exit 1
+          fi
+
+          # Get binary size
+          ls -lh "$BINARY_PATH"
+
+          # Test 1: Measure cold-start time with --help
+          echo ""
+          echo "=== Cold-start test with --help ==="
+          powershell -Command "Measure-Command { & '$BINARY_PATH' --help } | Select-Object TotalSeconds"
+          "$BINARY_PATH" --help
+
+          # Test 2: Convert test.html to test.md and measure time
+          echo ""
+          echo "=== Converting test.html to test.md ==="
+          powershell -Command "Measure-Command { & '$BINARY_PATH' test.html | Out-File -FilePath test.md } | Select-Object TotalSeconds"
+
+          # Show the output
+          echo ""
+          echo "=== Conversion output (test.md) ==="
+          cat test.md
+
+          # Verify output contains expected content
+          echo ""
+          echo "=== Verification ==="
+          if grep -q "Nuitka Binary Performance Test" test.md; then
+            echo "✓ Conversion successful - found expected heading"
+          else
+            echo "✗ Conversion failed - expected heading not found"
+            exit 1
+          fi
+
+          # Test 3: Multiple runs to test warm performance
+          echo ""
+          echo "=== Warm-start performance test (5 runs) ==="
+          for i in {1..5}; do
+            echo "Run $i:"
+            powershell -Command "Measure-Command { & '$BINARY_PATH' test.html | Out-Null } | Select-Object TotalSeconds"
+          done
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: markitdown-nuitka-${{ steps.platform.outputs.name }}
+          path: bin/${{ steps.platform.outputs.name }}-nuitka/*
+          retention-days: 30
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ steps.platform.outputs.name }}
+          path: test.md
+          retention-days: 30
+
+  compare-results:
+    name: Compare Nuitka vs PyInstaller
+    needs: build-nuitka
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Download test results
+        uses: actions/download-artifact@v4
+        with:
+          path: test-results
+          pattern: test-results-*
+
+      - name: Display summary
+        run: |
+          echo "=== Nuitka Trial Build Complete ==="
+          echo ""
+          echo "Test results have been uploaded as artifacts."
+          echo "Review the workflow logs to compare cold-start times between platforms."
+          echo ""
+          echo "Next steps:"
+          echo "1. Compare cold-start times with PyInstaller builds"
+          echo "2. Compare binary sizes"
+          echo "3. Test on different platforms"
+          echo ""
+          echo "Files tested:"
+          ls -la test-results/ || true
